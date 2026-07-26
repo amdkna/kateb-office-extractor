@@ -5,10 +5,11 @@ import json
 import logging
 import math
 import os
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import requests
 from dotenv import load_dotenv
@@ -36,6 +37,8 @@ class Settings:
     max_lng: float
     coverage_radius_km: float
     request_delay: float
+    batch_query_count: int
+    batch_delay: float
     timeout: float
     max_retries: int
     verify_ssl: bool
@@ -78,6 +81,8 @@ class Settings:
                 os.getenv("COVERAGE_RADIUS_KM", "1.8")
             ),
             request_delay=float(os.getenv("REQUEST_DELAY_SECONDS", "1.0")),
+            batch_query_count=int(os.getenv("BATCH_QUERY_COUNT", "10")),
+            batch_delay=float(os.getenv("BATCH_DELAY_SECONDS", "10")),
             timeout=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30")),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),
             verify_ssl=os.getenv("VERIFY_SSL", "true").lower() in {"1", "true", "yes"},
@@ -91,6 +96,48 @@ class Settings:
             ),
             cookie_header=os.getenv("COOKIE_HEADER", "").strip(),
         )
+
+
+@dataclass
+class ScanControl:
+    """Thread-safe controls shared by CLI and graphical collection runs."""
+
+    pause_event: threading.Event = field(default_factory=threading.Event)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+
+    def pause(self) -> None:
+        self.pause_event.set()
+
+    def resume(self) -> None:
+        self.pause_event.clear()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.pause_event.clear()
+
+    def wait(self, seconds: float = 0) -> bool:
+        """Wait interruptibly; paused time does not consume the delay."""
+        remaining = max(0.0, float(seconds))
+        last_tick = time.monotonic()
+        while True:
+            if self.stop_event.is_set():
+                return False
+            if self.pause_event.is_set():
+                self.stop_event.wait(0.1)
+                last_tick = time.monotonic()
+                continue
+            if remaining <= 0:
+                return True
+            wait_slice = min(0.1, remaining)
+            if self.stop_event.wait(wait_slice):
+                return False
+            now = time.monotonic()
+            remaining -= now - last_tick
+            last_tick = now
+
+
+class ScanStopped(Exception):
+    pass
 
 
 def configure_logging(verbose: bool = False) -> None:
@@ -198,6 +245,24 @@ def refinement_points(
     ]
 
 
+def planned_scan_points(
+    settings: Settings,
+    database: OfficeDatabase,
+) -> list[tuple[float, float]]:
+    """Build the current base grid plus known saturation refinements."""
+    points = grid_points(settings)
+    queued_points = set(points)
+    for saturated_lat, saturated_lng in database.saturated_scan_points(
+        settings.endpoint,
+        settings.saturation_threshold,
+    ):
+        for point in refinement_points(settings, saturated_lat, saturated_lng):
+            if point not in queued_points:
+                queued_points.add(point)
+                points.append(point)
+    return points
+
+
 def request_public(
     session: requests.Session, settings: Settings, lat: float, lng: float
 ) -> Any:
@@ -243,11 +308,20 @@ def create_browser_context(settings: Settings):
     return playwright, context
 
 
-def ensure_browser_login(context, settings: Settings) -> None:
+def ensure_browser_login(
+    context,
+    settings: Settings,
+    login_callback: Callable[[], bool] | None = None,
+) -> None:
     page = context.pages[0] if context.pages else context.new_page()
     page.goto(settings.search_url, wait_until="domcontentloaded", timeout=120_000)
 
     if settings.headless:
+        return
+
+    if login_callback is not None:
+        if not login_callback():
+            raise ScanStopped("Collection stopped before browser login was confirmed.")
         return
 
     print(
@@ -331,19 +405,20 @@ def run(
     settings: Settings,
     verbose: bool = False,
     rescan: bool = False,
+    control: ScanControl | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    login_callback: Callable[[], bool] | None = None,
 ) -> int:
     configure_logging(verbose)
+    control = control or ScanControl()
+
+    def report_progress(current: int, total: int, status: str) -> None:
+        if progress_callback is not None:
+            progress_callback(current, total, status)
+
     database = OfficeDatabase(settings.database_path)
-    points = grid_points(settings)
+    points = planned_scan_points(settings, database)
     queued_points = set(points)
-    for saturated_lat, saturated_lng in database.saturated_scan_points(
-        settings.endpoint,
-        settings.saturation_threshold,
-    ):
-        for point in refinement_points(settings, saturated_lat, saturated_lng):
-            if point not in queued_points:
-                queued_points.add(point)
-                points.append(point)
     planned_count = len(points)
     status_before = database.scan_status_counts(settings.endpoint)
     if not rescan:
@@ -379,12 +454,19 @@ def run(
     total_skipped = 0
     completed_this_run = 0
     failed_this_run = 0
+    attempted_requests = 0
+    stopped = False
+    report_progress(0, len(points), "ready")
 
     try:
         index = 0
         while index < len(points):
+            if not control.wait():
+                stopped = True
+                break
             lat, lng = points[index]
             index += 1
+            attempted_requests += 1
 
             LOG.info("[%d/%d] Querying %.6f, %.6f", index, len(points), lat, lng)
             payload = None
@@ -402,7 +484,11 @@ def run(
                     if browser_context is None:
                         LOG.info("Starting Chrome browser fallback...")
                         browser_runtime, browser_context = create_browser_context(settings)
-                        ensure_browser_login(browser_context, settings)
+                        ensure_browser_login(
+                            browser_context,
+                            settings,
+                            login_callback,
+                        )
                     payload = request_browser(browser_context, settings, lat, lng)
 
                 entries = find_entry_list(payload)
@@ -453,6 +539,9 @@ def run(
                             "Response may be capped; queued %d denser follow-up points.",
                             added,
                         )
+            except ScanStopped:
+                stopped = True
+                break
             except Exception as exc:
                 failed_this_run += 1
                 database.mark_scan_failure(
@@ -468,8 +557,25 @@ def run(
                     exc,
                 )
 
+            report_progress(index, len(points), "running")
             if index < len(points):
-                time.sleep(settings.request_delay)
+                if not control.wait(settings.request_delay):
+                    stopped = True
+                    break
+                if (
+                    settings.batch_query_count > 0
+                    and settings.batch_delay > 0
+                    and attempted_requests % settings.batch_query_count == 0
+                ):
+                    LOG.info(
+                        "Batch delay: %d queries completed; waiting %.1f seconds.",
+                        attempted_requests,
+                        settings.batch_delay,
+                    )
+                    report_progress(index, len(points), "batch-delay")
+                    if not control.wait(settings.batch_delay):
+                        stopped = True
+                        break
 
     except KeyboardInterrupt:
         LOG.warning(
@@ -478,9 +584,19 @@ def run(
         return 130
     finally:
         if browser_context is not None:
-            browser_context.close()
+            try:
+                browser_context.close()
+            except Exception:
+                LOG.debug("Browser context was already closed.", exc_info=True)
         if browser_runtime is not None:
             browser_runtime.stop()
+
+    if stopped:
+        LOG.warning(
+            "Collection force-stopped. Database progress is saved; rerun to resume."
+        )
+        report_progress(index, len(points), "stopped")
+        return 130
 
     LOG.info(
         "Scan complete. Coordinates checked: %d; failed: %d; "
@@ -499,6 +615,7 @@ def run(
         final_status["done"],
         final_status["failed"],
     )
+    report_progress(len(points), len(points), "finished")
     return 1 if failed_this_run else 0
 
 
@@ -557,8 +674,22 @@ def main() -> int:
                     },
                     "grid_points": len(points),
                     "estimated_minutes": round(
-                        len(points) * settings.request_delay / 60, 1
+                        (
+                            len(points) * settings.request_delay
+                            + (
+                                len(points) // settings.batch_query_count
+                                if settings.batch_query_count > 0
+                                else 0
+                            )
+                            * settings.batch_delay
+                        )
+                        / 60,
+                        1,
                     ),
+                    "batch_delay": {
+                        "every_queries": settings.batch_query_count,
+                        "wait_seconds": settings.batch_delay,
+                    },
                     "saturation_threshold": settings.saturation_threshold,
                 },
                 indent=2,

@@ -1,11 +1,13 @@
 import math
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from extractor import Settings, grid_points, refinement_points, run
+from extractor import ScanControl, Settings, grid_points, refinement_points, run
 from office_data import OfficeDatabase
 
 
@@ -24,6 +26,8 @@ def test_settings(database_path: Path) -> Settings:
         max_lng=51.40,
         coverage_radius_km=1.8,
         request_delay=0,
+        batch_query_count=10,
+        batch_delay=0,
         timeout=1,
         max_retries=0,
         verify_ssl=True,
@@ -157,6 +161,52 @@ class ExtractorTests(unittest.TestCase):
                 database.scan_status_counts("/geo"),
                 {"done": expected_points, "failed": 0},
             )
+
+    def test_force_stop_prevents_network_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = test_settings(Path(temporary) / "offices.sqlite3")
+            control = ScanControl()
+            control.stop()
+            with patch("extractor.request_public") as request:
+                self.assertEqual(run(settings, control=control), 130)
+                request.assert_not_called()
+
+    def test_pause_blocks_until_resume(self):
+        control = ScanControl()
+        control.pause()
+        result: list[bool] = []
+        worker = threading.Thread(target=lambda: result.append(control.wait()))
+        worker.start()
+        time.sleep(0.2)
+        self.assertEqual(result, [])
+        control.resume()
+        worker.join(timeout=2)
+        self.assertEqual(result, [True])
+
+    def test_batch_delay_runs_after_configured_query_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = replace(
+                test_settings(Path(temporary) / "offices.sqlite3"),
+                batch_query_count=2,
+                batch_delay=7,
+            )
+            control = ScanControl()
+            original_wait = control.wait
+            waits: list[float] = []
+
+            def recorded_wait(seconds: float = 0) -> bool:
+                waits.append(seconds)
+                if seconds == 7:
+                    return True
+                return original_wait(seconds)
+
+            with patch.object(control, "wait", side_effect=recorded_wait):
+                with patch(
+                    "extractor.request_public",
+                    return_value={"data": []},
+                ):
+                    self.assertEqual(run(settings, control=control), 0)
+            self.assertIn(7, waits)
 
 
 if __name__ == "__main__":

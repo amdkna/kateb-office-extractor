@@ -69,6 +69,25 @@ class OfficeDataTests(unittest.TestCase):
             {"09125254214"},
         )
 
+    def test_scan_point_statuses_include_done_and_failed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = OfficeDatabase(Path(temporary) / "offices.sqlite3")
+            with database.connect() as connection:
+                database.mark_scan_point(
+                    connection, "/geo", 35.7, 51.4, 2, 1, 1
+                )
+            database.mark_scan_failure(
+                "/geo", 35.71, 51.41, "authentication failed"
+            )
+
+            self.assertEqual(
+                database.scan_point_statuses("/geo"),
+                {
+                    (35.7, 51.4): "done",
+                    (35.71, 51.41): "failed",
+                },
+            )
+
     def test_duplicate_telephone_updates_one_record(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

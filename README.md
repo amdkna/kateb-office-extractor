@@ -24,6 +24,11 @@ import, and Excel export.
 - Resumable collection with a persistent coordinate ledger
 - Failed-coordinate tracking and retry-only restarts
 - Windows desktop UI with:
+  - graphical website collection and progress
+  - live street-map coverage with color-coded scan squares
+  - selectable, copyable live console logs
+  - pause/resume and force-stop controls
+  - configurable batch throttling
   - live search above every column
   - ascending and descending column sorting
   - pagination
@@ -91,6 +96,10 @@ run-office-manager.vbs
 The VBS launcher starts `office_manager.pyw` through `pythonw.exe`, so no black
 command window remains open behind the application.
 
+Open the **Website collection** tab to run the collector graphically. Chrome
+still opens for authenticated access, but collector output is displayed inside
+the app instead of a terminal.
+
 ## Default Greater Tehran coverage
 
 The example configuration covers the Greater Tehran metropolitan rectangle:
@@ -132,6 +141,8 @@ Copy `.env.example` to `.env` and adjust values locally. Never commit `.env`.
 | `COVERAGE_RADIUS_KM` | Conservative effective coverage radius |
 | `SATURATION_THRESHOLD` | Response size that triggers denser local probes |
 | `REQUEST_DELAY_SECONDS` | Delay between requests |
+| `BATCH_QUERY_COUNT` | Number of API queries between longer rest periods |
+| `BATCH_DELAY_SECONDS` | Length of each batch rest period in seconds |
 | `REQUEST_TIMEOUT_SECONDS` | Per-request timeout |
 | `MAX_RETRIES` | Retry count for transient HTTP failures |
 | `VERIFY_SSL` | Enable TLS certificate verification |
@@ -203,6 +214,42 @@ The **File** menu provides:
   same telephone deduplication rules
 - **Export to Excel** — exports the current filtered and sorted result set to
   an `.xlsx` workbook
+
+### Graphical website collection
+
+The **Website collection** tab includes:
+
+- **Coverage map** — shows OpenStreetMap beneath transparent scan squares;
+  green is downloaded, red is failed, and blue has not been tried yet
+- **Live map totals** — reports downloaded, failed, and pending coordinates and
+  refreshes after every request
+- **Start / resume collection** — starts the normal retry-aware scan in a
+  background thread
+- **Pause / Resume** — pauses between requests and also pauses active delay
+  countdowns; an already-running request is allowed to finish safely
+- **Force stop** — signals collection to stop immediately after any active
+  request returns; all completed database work remains saved
+- **Batch delay** — configurable as “after every X API queries, wait Y seconds”
+- **Progress bar** — shows processed and remaining coordinates
+- **Collector console** — displays live logs in a scrollable text area
+
+Console text is selectable and copyable using Ctrl+C, the **Copy selected**
+button, or the right-click menu. The console can be cleared without affecting
+the database or coordinate ledger.
+
+Street-map tiles are downloaded from OpenStreetMap on first use and cached in
+`data/map_tiles`. Previously loaded areas therefore remain visible offline.
+
+The default batch throttle is:
+
+```dotenv
+BATCH_QUERY_COUNT=10
+BATCH_DELAY_SECONDS=10
+```
+
+Values entered in the graphical tab apply to that run. Set either value to `0`
+to disable the longer batch delay. The ordinary per-query delay from
+`REQUEST_DELAY_SECONDS` remains active.
 
 ## Resume and rescan behavior
 

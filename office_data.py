@@ -532,6 +532,27 @@ class OfficeDatabase:
                 for row in rows
             }
 
+    def scan_point_statuses(
+        self,
+        endpoint: str,
+    ) -> dict[tuple[float, float], str]:
+        """Return the latest persisted state for every attempted coordinate."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT latitude, longitude, status
+                FROM scan_points
+                WHERE endpoint = ?
+                """,
+                (endpoint,),
+            ).fetchall()
+            return {
+                (float(row["latitude"]), float(row["longitude"])): str(
+                    row["status"]
+                )
+                for row in rows
+            }
+
     def scan_status_counts(self, endpoint: str) -> dict[str, int]:
         counts = {"done": 0, "failed": 0}
         with self.connect() as connection:
